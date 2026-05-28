@@ -26,7 +26,7 @@ class EMP(nn.Module):
         self.args = args
         self.num_relations = num_relations
 
-        # 初始化层间交互矩阵 (对应论文中的 \hat{C})
+        # 初始化层间交互矩阵
         if self.args.prop_scheme in ['sequential', 'parallel'] and num_relations > 1:
             self.rel_adj = nn.Parameter(torch.Tensor(num_relations, num_relations))
             nn.init.xavier_uniform_(self.rel_adj)
@@ -37,6 +37,14 @@ class EMP(nn.Module):
         self.encoder.reset_parameters()
         if self.rel_adj is not None:
             nn.init.xavier_uniform_(self.rel_adj)
+
+    # 🟢 移植 GNNSafe 中的修复：强制归一化交互矩阵 (dim=0)
+    def get_relation_matrix(self):
+        if self.rel_adj is not None:
+            eye = torch.eye(self.num_relations, device=self.rel_adj.device)
+            rel_logits = self.rel_adj + 2.0 * eye
+            return torch.softmax(rel_logits, dim=0)
+        return None
 
     def _get_processed_adjs(self, dataset, device):
         """缓存归一化的稀疏邻接矩阵"""
@@ -63,7 +71,7 @@ class EMP(nn.Module):
         """
         核心能量传播层
         alpha: 层内残差系数
-        alpha_inter: 层间残差系数 (即论文中的 \beta)
+        alpha_inter: 层间残差系数
         """
         e_in = e.unsqueeze(1)  # [N, 1]
 
@@ -84,9 +92,9 @@ class EMP(nn.Module):
         elif self.args.prop_scheme == 'sequential':
             if self.rel_adj is not None:
                 E_inter = E_intra.clone()
+                C = self.get_relation_matrix() # 🟢 修复：使用归一化后的矩阵
                 for _ in range(prop_layers):
-                    # 严格对应 Eq. 8: 使用 alpha_inter (\beta)
-                    E_inter = E_inter * alpha_inter + torch.matmul(E_inter, self.rel_adj) * (1 - alpha_inter)
+                    E_inter = E_inter * alpha_inter + torch.matmul(E_inter, C) * (1 - alpha_inter)
                 E_final_matrix = E_inter
             else:
                 E_final_matrix = E_intra
@@ -95,9 +103,9 @@ class EMP(nn.Module):
             if self.rel_adj is not None:
                 E_raw = e.unsqueeze(1).repeat(1, self.num_relations)
                 E_inter_branch = E_raw.clone()
+                C = self.get_relation_matrix() # 🟢 修复：使用归一化后的矩阵
                 for _ in range(prop_layers):
-                    # 严格对应 Eq. 8: 使用 alpha_inter (\beta)
-                    E_inter_branch = E_inter_branch * alpha_inter + torch.matmul(E_inter_branch, self.rel_adj) * (1 - alpha_inter)
+                    E_inter_branch = E_inter_branch * alpha_inter + torch.matmul(E_inter_branch, C) * (1 - alpha_inter)
                 E_final_matrix = (E_intra + E_inter_branch) / 2
             else:
                 E_final_matrix = E_intra
@@ -118,7 +126,6 @@ class EMP(nn.Module):
             neg_energy = args.T * torch.logsumexp(logits / args.T, dim=-1)
 
         if args.use_prop:
-            # 透传 alpha_inter
             neg_energy = self.propagation(neg_energy, adjs, args.K, args.alpha, args.alpha_inter)
 
         return neg_energy[node_idx]
@@ -147,12 +154,12 @@ class EMP(nn.Module):
             energy_out = -args.T * torch.logsumexp(logits_out / args.T, dim=-1)
 
             if args.use_prop:
-                # 透传 alpha_inter
                 energy_in = self.propagation(energy_in, adjs_in, args.K, args.alpha, args.alpha_inter)[train_in_idx]
                 energy_out = self.propagation(energy_out, adjs_out, args.K, args.alpha, args.alpha_inter)[train_ood_idx]
             else:
                 energy_in = energy_in[train_in_idx]
-                energy_out = energy_out[train_in_idx]
+                # 🟢 移植 GNNSafe 修复：未开启 prop 时，OOD 的能量损失必须在 OOD 节点上计算
+                energy_out = energy_out[train_ood_idx]
 
             # Shape matching
             if energy_in.shape[0] != energy_out.shape[0]:
